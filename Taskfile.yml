@@ -1,0 +1,59 @@
+# Run with the pinned go-task:  go tool task <name>
+version: "3"
+
+vars:
+  VERSION:
+    sh: git describe --tags --always --dirty 2>/dev/null || echo dev
+  LDFLAGS: -s -w -X main.version={{.VERSION}}
+
+tasks:
+  default:
+    cmds:
+      - task: build
+
+  build:
+    desc: Build the relay for this machine into bin/
+    cmds:
+      - go build -trimpath -ldflags "{{.LDFLAGS}}" -o bin/openbekci-relay{{exeExt}} ./cmd/openbekci-relay
+
+  test:
+    desc: Run all tests
+    cmds:
+      - go test -count=1 ./...
+
+  test:race:
+    desc: Run all tests with -race (needs cgo and a C compiler)
+    env:
+      CGO_ENABLED: "1"
+    cmds:
+      - go test -count=1 -race ./...
+
+  lint:
+    desc: go vet, go mod tidy -diff and golangci-lint
+    cmds:
+      - go vet ./...
+      - go mod tidy -diff
+      - go tool golangci-lint run ./...
+
+  build:linux-amd64:
+    desc: Static linux/amd64 binary
+    env:
+      CGO_ENABLED: "0"
+      GOOS: linux
+      GOARCH: amd64
+    cmds:
+      - go build -trimpath -ldflags "{{.LDFLAGS}}" -o dist/openbekci-relay-linux-amd64 ./cmd/openbekci-relay
+
+  build:linux-arm64:
+    desc: Static linux/arm64 binary
+    env:
+      CGO_ENABLED: "0"
+      GOOS: linux
+      GOARCH: arm64
+    cmds:
+      - go build -trimpath -ldflags "{{.LDFLAGS}}" -o dist/openbekci-relay-linux-arm64 ./cmd/openbekci-relay
+
+  docker:
+    desc: Build the container image
+    cmds:
+      - docker build --build-arg VERSION={{.VERSION}} -t openbekci-relay:{{.VERSION}} .
