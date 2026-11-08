@@ -284,3 +284,17 @@ func TestConfigValidation(t *testing.T) {
 		t.Errorf("sandbox base %v %v", s, err)
 	}
 }
+
+func TestDefaultTransportPingsIdleHTTP2Connections(t *testing.T) {
+	f := newFakeAPNs(t)
+	der, _ := x509.MarshalPKCS8PrivateKey(f.key)
+	pemKey := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})
+	s, err := New(Config{KeyPEM: pemKey, KeyID: "K", TeamID: "T", Topic: "org.example"}, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr, ok := s.client.Transport.(*http.Transport)
+	if !ok || !tr.ForceAttemptHTTP2 || tr.HTTP2 == nil || tr.HTTP2.SendPingTimeout <= 0 || tr.HTTP2.PingTimeout <= 0 {
+		t.Errorf("default APNs transport lacks HTTP/2 health pings: %+v", s.client.Transport)
+	}
+}

@@ -74,10 +74,6 @@ type syncBuf struct {
 func (s *syncBuf) Write(p []byte) (int, error) { s.mu.Lock(); defer s.mu.Unlock(); return s.b.Write(p) }
 func (s *syncBuf) String() string              { s.mu.Lock(); defer s.mu.Unlock(); return s.b.String() }
 
-type verifierFunc func(ctx context.Context, baseURL, challenge string) error
-
-func (f verifierFunc) Verify(ctx context.Context, b, c string) error { return f(ctx, b, c) }
-
 func newHarness(t *testing.T, mutate func(*config.Config), verify httpapi.Verifier) *harness {
 	t.Helper()
 	h := &harness{t: t, fcm: &fakeSender{}, apns: &fakeSender{}, logBuf: &syncBuf{}}

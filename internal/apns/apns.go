@@ -95,6 +95,10 @@ func New(c Config, o Options) (*Sender, error) {
 				TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS12},
 				MaxIdleConnsPerHost: 8,
 				IdleConnTimeout:     90 * time.Second,
+				// Detect a silently dead HTTP/2 connection (NAT or firewall drop)
+				// by pinging after 30s without reads instead of waiting for a
+				// request to time out; the transport then reconnects.
+				HTTP2: &http.HTTP2Config{SendPingTimeout: 30 * time.Second, PingTimeout: 10 * time.Second},
 			},
 		}
 	}
