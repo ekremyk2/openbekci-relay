@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -753,5 +754,50 @@ func TestPanickingSenderIsContained(t *testing.T) {
 	if r.Results[0].Status != push.StatusOK || r.Results[2].Status != push.StatusOK ||
 		r.Results[1].Status != push.StatusError || r.Results[1].Code != "internal" {
 		t.Errorf("results %+v", r.Results)
+	}
+}
+
+func TestRateKeyNormalisesAddresses(t *testing.T) {
+	same := [][]string{
+		{"2001:db8:1:2::1", "2001:DB8:1:2:ffff:ffff:ffff:ffff", "2001:db8:1:2::1%eth0"},
+		{"203.0.113.9", "::ffff:203.0.113.9"},
+	}
+	for _, g := range same {
+		for _, a := range g[1:] {
+			if httpapi.RateKey(a) != httpapi.RateKey(g[0]) {
+				t.Errorf("RateKey(%q)=%q, want %q", a, httpapi.RateKey(a), httpapi.RateKey(g[0]))
+			}
+		}
+	}
+	if httpapi.RateKey("2001:db8:1:2::1") == httpapi.RateKey("2001:db8:1:3::1") {
+		t.Error("different /64s share a key")
+	}
+	if httpapi.RateKey("203.0.113.9") == httpapi.RateKey("203.0.113.10") {
+		t.Error("different IPv4 addresses share a key")
+	}
+}
+
+func TestEnrollRateLimitCannotBeEvadedByRotatingWithinAnIPv6Prefix(t *testing.T) {
+	h := newHarness(t, func(c *config.Config) {
+		c.Enrollment = config.EnrollClosed
+		c.EnrollPerMinPerIP = 2
+		c.TrustedProxies = []netip.Prefix{netip.MustParsePrefix("127.0.0.1/32")}
+	}, nil)
+	var limited int
+	for i := range 6 {
+		req, _ := http.NewRequest(http.MethodPost, h.ts.URL+"/v1/enrollments", strings.NewReader(`{}`))
+		// Same /64, a new address (and a new spelling) every time.
+		req.Header.Set("X-Forwarded-For", "2001:db8:aa:bb::"+strconv.Itoa(i+1))
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode == http.StatusTooManyRequests {
+			limited++
+		}
+	}
+	if limited != 4 {
+		t.Errorf("%d of 6 requests limited, want 4 (2 allowed per prefix)", limited)
 	}
 }
