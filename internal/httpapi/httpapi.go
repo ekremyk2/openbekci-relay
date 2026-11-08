@@ -363,6 +363,10 @@ func (s *Server) dispatch(ctx context.Context, msgs []push.Message, results []Re
 	sem := make(chan struct{}, s.Cfg.SendConcurrency)
 	var wg sync.WaitGroup
 	for _, i := range idx {
+		if ctx.Err() != nil { // select picks randomly when both cases are ready
+			results[i] = Result{Index: i, Status: push.StatusError, Code: "request_deadline", Retryable: true}
+			continue
+		}
 		select {
 		case sem <- struct{}{}:
 		case <-ctx.Done():
