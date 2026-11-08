@@ -1,0 +1,8 @@
+/dist/
+/bin/
+*.exe
+*.test
+*.db
+*.db-wal
+*.db-shm
+.claude/
