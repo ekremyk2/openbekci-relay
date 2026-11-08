@@ -147,7 +147,7 @@ func (s *Sender) accessToken(ctx context.Context, stale string) (string, error) 
 	if f == nil {
 		f = &tokenFetch{done: make(chan struct{})}
 		s.inflight = f
-		go s.fetchToken(f)
+		go s.fetchToken(f) //nolint:gosec // detached on purpose: the shared exchange must outlive any one caller's ctx
 	}
 	s.mu.Unlock()
 	select {
