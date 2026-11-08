@@ -71,9 +71,10 @@ type Sender struct {
 	client *http.Client
 	now    func() time.Time
 
-	mu      sync.Mutex
-	token   string
-	expires time.Time
+	mu       sync.Mutex
+	token    string
+	expires  time.Time
+	inflight *tokenFetch
 }
 
 // New builds a Sender from credentials.
@@ -121,49 +122,95 @@ func (s *Sender) assertion() (string, error) {
 	return signing + "." + b64(sig), nil
 }
 
-func (s *Sender) accessToken(ctx context.Context, force bool) (string, error) {
+// tokenFetch is one in-flight OAuth exchange shared by every caller that
+// needs a token while it runs.
+type tokenFetch struct {
+	done chan struct{}
+	tok  string
+	err  error
+}
+
+// accessToken returns a valid access token. stale is the token the caller just
+// saw rejected (empty on the first attempt): a cached token different from it
+// is already the refreshed one. At most one exchange runs at a time
+// (single-flight); callers wait for it but give up when their own ctx ends, and
+// the exchange itself is not tied to any one caller's context, so a short
+// deadline on one message cannot fail the others.
+func (s *Sender) accessToken(ctx context.Context, stale string) (string, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if !force && s.token != "" && s.now().Before(s.expires) {
-		return s.token, nil
+	if s.token != "" && s.token != stale && s.now().Before(s.expires) {
+		tok := s.token
+		s.mu.Unlock()
+		return tok, nil
 	}
+	f := s.inflight
+	if f == nil {
+		f = &tokenFetch{done: make(chan struct{})}
+		s.inflight = f
+		go s.fetchToken(f)
+	}
+	s.mu.Unlock()
+	select {
+	case <-f.done:
+		return f.tok, f.err
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+func (s *Sender) fetchToken(f *tokenFetch) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	tok, life, err := s.exchange(ctx)
+	s.mu.Lock()
+	if err == nil {
+		s.token = tok
+		s.expires = s.now().Add(life)
+	}
+	s.inflight = nil
+	s.mu.Unlock()
+	f.tok, f.err = tok, err
+	close(f.done)
+}
+
+// exchange performs the JWT-bearer grant and returns the token and how long to
+// cache it.
+func (s *Sender) exchange(ctx context.Context) (string, time.Duration, error) {
 	as, err := s.assertion()
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 	form := url.Values{"grant_type": {"urn:ietf:params:oauth:grant-type:jwt-bearer"}, "assertion": {as}}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.cred.TokenURI, strings.NewReader(form.Encode()))
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("oauth token endpoint returned %d", resp.StatusCode)
+		return "", 0, fmt.Errorf("oauth token endpoint returned %d", resp.StatusCode)
 	}
 	var tr struct {
 		AccessToken string `json:"access_token"`
 		ExpiresIn   int    `json:"expires_in"`
 	}
 	if err := json.Unmarshal(body, &tr); err != nil || tr.AccessToken == "" {
-		return "", errors.New("oauth token endpoint returned no access_token")
+		return "", 0, errors.New("oauth token endpoint returned no access_token")
 	}
 	if tr.ExpiresIn <= 0 {
 		tr.ExpiresIn = 3600
 	}
-	s.token = tr.AccessToken
 	// Refresh a minute early, but never cache for less than a second.
 	life := time.Duration(tr.ExpiresIn)*time.Second - time.Minute
 	if life < time.Second {
 		life = time.Second
 	}
-	s.expires = s.now().Add(life)
-	return s.token, nil
+	return tr.AccessToken, life, nil
 }
 
 // buildBody renders the FCM v1 request. The message is data-only: the app
@@ -200,9 +247,10 @@ func (s *Sender) Send(ctx context.Context, m push.Message) push.Result {
 	if err != nil {
 		return push.Result{Status: push.StatusError, Code: "encode_failed"}
 	}
+	stale := ""
 	endpoint := s.base + "/v1/projects/" + url.PathEscape(s.cred.ProjectID) + "/messages:send"
 	for attempt := 0; attempt < 2; attempt++ {
-		tok, err := s.accessToken(ctx, attempt > 0)
+		tok, err := s.accessToken(ctx, stale)
 		if err != nil {
 			return push.Result{Status: push.StatusError, Code: "provider_auth_failed", Retryable: true}
 		}
@@ -219,6 +267,7 @@ func (s *Sender) Send(ctx context.Context, m push.Message) push.Result {
 		rb, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 		_ = resp.Body.Close()
 		if resp.StatusCode == http.StatusUnauthorized && attempt == 0 {
+			stale = tok
 			continue // token revoked early: refresh once
 		}
 		return classify(resp.StatusCode, rb)
@@ -248,7 +297,9 @@ func classify(status int, body []byte) push.Result {
 		}
 	}
 	switch {
-	case code == "UNREGISTERED" || status == http.StatusNotFound:
+	// 404 alone is not enough: a wrong project id also answers 404 NOT_FOUND,
+	// and a misconfigured relay must not make instances drop healthy devices.
+	case code == "UNREGISTERED":
 		return push.Result{Status: push.StatusInvalidToken, Code: "unregistered"}
 	case code == "INVALID_ARGUMENT" && status == http.StatusBadRequest && tokenFieldViolation(body):
 		return push.Result{Status: push.StatusInvalidToken, Code: "invalid_argument_token"}
