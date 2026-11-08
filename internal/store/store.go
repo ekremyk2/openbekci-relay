@@ -125,12 +125,35 @@ CREATE TABLE IF NOT EXISTS quota (
 ) WITHOUT ROWID;
 `
 
+// securePath makes sure a newly created database directory is 0700 and the
+// database file exists with mode 0600 before SQLite opens it. The relay keeps
+// server secrets in clear, so other local users must not read the file. SQLite
+// creates the -wal and -shm files with the permissions of the main database
+// file, so pre-creating it restricted covers them too. An existing directory
+// is left alone (it may be a shared mount); the file mode protects the data.
+func securePath(path string) error {
+	dir := filepath.Dir(path)
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return err
+		}
+	}
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0o600)
+}
+
 // Open opens (creating if needed) the database at path and applies the schema.
 func Open(path string, now func() time.Time) (*Store, error) {
 	if now == nil {
 		now = time.Now
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+	if err := securePath(path); err != nil {
 		return nil, err
 	}
 	dsn := "file:" + filepath.ToSlash(path) + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)"
