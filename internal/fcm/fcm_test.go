@@ -1,6 +1,7 @@
 package fcm
 
 import (
+	"context"
 	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
@@ -35,6 +36,7 @@ type fakeGoogle struct {
 	sendPaths  []string
 	sendStatus func(call int) (int, string)
 	sendCalls  atomic.Int32
+	tokenHang  chan struct{} // when set, the token endpoint blocks until it is closed
 }
 
 func newFakeGoogle(t *testing.T) *fakeGoogle {
@@ -60,6 +62,12 @@ func (g *fakeGoogle) creds() Credentials {
 
 func (g *fakeGoogle) token(w http.ResponseWriter, r *http.Request) {
 	n := g.tokenCalls.Add(1)
+	if g.tokenHang != nil {
+		select {
+		case <-g.tokenHang:
+		case <-r.Context().Done():
+		}
+	}
 	_ = r.ParseForm()
 	if r.Form.Get("grant_type") != "urn:ietf:params:oauth:grant-type:jwt-bearer" {
 		http.Error(w, "bad grant", 400)
@@ -207,7 +215,7 @@ func TestErrorClassification(t *testing.T) {
 		retry  bool
 	}{
 		{"unregistered", 404, `{"error":{"code":404,"status":"NOT_FOUND","details":[{"@type":"type.googleapis.com/google.firebase.fcm.v1.FcmError","errorCode":"UNREGISTERED"}]}}`, push.StatusInvalidToken, "unregistered", false},
-		{"404 bare", 404, `{}`, push.StatusInvalidToken, "unregistered", false},
+		{"404 bare (wrong project id)", 404, `{"error":{"code":404,"status":"NOT_FOUND"}}`, push.StatusError, "provider_rejected", false},
 		{"invalid token arg", 400, `{"error":{"status":"INVALID_ARGUMENT","details":[{"fieldViolations":[{"field":"message.token","description":"bad"}]}]}}`, push.StatusInvalidToken, "invalid_argument_token", false},
 		{"invalid other arg", 400, `{"error":{"status":"INVALID_ARGUMENT","details":[{"fieldViolations":[{"field":"message.data","description":"bad"}]}]}}`, push.StatusError, "provider_rejected", false},
 		{"throttled", 429, `{"error":{"status":"RESOURCE_EXHAUSTED"}}`, push.StatusError, "provider_throttled", true},
@@ -253,5 +261,57 @@ func TestParseCredentials(t *testing.T) {
 	}
 	if _, err := New(Credentials{ProjectID: "p", ClientEmail: "e", PrivateKey: "nope"}, Options{}); err == nil {
 		t.Error("bad key accepted")
+	}
+}
+
+func TestConcurrentUnauthorizedSharesOneRefresh(t *testing.T) {
+	g := newFakeGoogle(t)
+	const n = 12
+	g.sendStatus = func(call int) (int, string) {
+		if call <= n { // every first attempt is rejected, as after a server-side revoke
+			return 401, `{"error":{"status":"UNAUTHENTICATED"}}`
+		}
+		return 200, `{}`
+	}
+	s, _ := New(g.creds(), Options{BaseURL: g.fcmSrv.URL})
+	var wg sync.WaitGroup
+	for range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if res := s.Send(t.Context(), testMsg()); res != push.OK {
+				t.Errorf("result %+v", res)
+			}
+		}()
+	}
+	wg.Wait()
+	// One exchange for the initial token and a shared one for the refresh; a
+	// refresh per rejected request would be n+1.
+	if got := g.tokenCalls.Load(); got > 3 {
+		t.Errorf("%d token exchanges for %d concurrent 401s, want at most 3", got, n)
+	}
+}
+
+func TestWaiterIsNotStalledByAnotherCallersTokenFetch(t *testing.T) {
+	g := newFakeGoogle(t)
+	g.tokenHang = make(chan struct{})
+	t.Cleanup(func() { close(g.tokenHang) }) // runs before the servers are closed
+	s, _ := New(g.creds(), Options{BaseURL: g.fcmSrv.URL})
+
+	long, cancelLong := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancelLong()
+	go s.Send(long, testMsg()) // starts the exchange that hangs
+	for g.tokenCalls.Load() == 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	short, cancelShort := context.WithTimeout(t.Context(), 150*time.Millisecond)
+	defer cancelShort()
+	start := time.Now()
+	res := s.Send(short, testMsg())
+	if took := time.Since(start); took > 2*time.Second {
+		t.Errorf("a 150ms-deadline caller waited %v behind another caller's token fetch", took)
+	}
+	if res.Status != push.StatusError || res.Code != "provider_auth_failed" {
+		t.Errorf("%+v", res)
 	}
 }
