@@ -26,6 +26,8 @@ func TestBlocked(t *testing.T) {
 		"127.0.0.1", "10.1.2.3", "172.16.0.1", "172.31.255.255", "192.168.1.1", "169.254.169.254", "100.64.0.1", "0.0.0.0",
 		"224.0.0.1", "255.255.255.255", "192.0.0.1", "198.18.0.1", "::1", "fe80::1", "fd00:ec2::254", "fc00::1", "::",
 		"::ffff:127.0.0.1", "::ffff:10.0.0.1", "::ffff:169.254.169.254", "ff02::1", "2001:db8::1",
+		// IPv4-compatible, 6to4, Teredo and NAT64 forms embedding loopback/metadata.
+		"::7f00:1", "::a9fe:a9fe", "2002:7f00:1::1", "2002:a9fe:a9fe::1", "2001:0:4136:e378:8000:63bf:80ff:fffe", "64:ff9b::7f00:1", "64:ff9b:1::a00:1", "192.88.99.1", "fe80::1%eth0",
 	} {
 		if !Blocked(netip.MustParseAddr(s)) {
 			t.Errorf("%s not blocked", s)
@@ -51,7 +53,8 @@ func TestParseBaseURL(t *testing.T) {
 			t.Errorf("%s -> %v %v", in, u, err)
 		}
 	}
-	for _, in := range []string{"http://x.example", "ftp://x.example", "https://", "https://u:p@x.example", "https://x.example?a=b", "https://x.example#f", "x.example", "", "https://%zz"} {
+	for _, in := range []string{"http://x.example", "ftp://x.example", "https://", "https://u:p@x.example", "https://x.example?a=b", "https://x.example#f", "x.example", "", "https://%zz",
+		"https://[fe80::1%25eth0]", "https://[2606:4700:4700::1111%25eth0]/"} {
 		if _, err := ParseBaseURL(in); !errors.Is(err, ErrBadURL) {
 			t.Errorf("%q accepted (%v)", in, err)
 		}

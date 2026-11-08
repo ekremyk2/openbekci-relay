@@ -42,7 +42,12 @@ var blocked = mustPrefixes(
 	"0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
 	"172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24", "192.168.0.0/16", "198.18.0.0/15",
 	"198.51.100.0/24", "203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4",
-	"::/128", "::1/128", "64:ff9b::/96", "100::/64", "2001:db8::/32", "fc00::/7", "fe80::/10", "ff00::/8",
+	// IPv6 forms that embed or tunnel an IPv4 address (IPv4-compatible,
+	// NAT64, 6to4, Teredo) are refused outright: the embedded address may be
+	// loopback or metadata and some stacks route them there.
+	"::/96", "64:ff9b::/96", "64:ff9b:1::/48", "2002::/16", "2001::/32",
+	"::1/128", "100::/64", "2001:db8::/32", "fc00::/7", "fe80::/10", "ff00::/8",
+	"192.88.99.0/24",
 )
 
 func mustPrefixes(s ...string) []netip.Prefix {
@@ -57,7 +62,7 @@ func mustPrefixes(s ...string) []netip.Prefix {
 // IPv4-mapped IPv6 addresses are unmapped first.
 func Blocked(ip netip.Addr) bool {
 	ip = ip.Unmap()
-	if !ip.IsValid() || ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+	if !ip.IsValid() || ip.Zone() != "" || ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
 		ip.IsMulticast() || ip.IsUnspecified() || ip.IsInterfaceLocalMulticast() {
 		return true
 	}
@@ -83,7 +88,7 @@ type Verifier struct {
 // ParseBaseURL validates base_url and returns the discovery document URL.
 func ParseBaseURL(base string) (*url.URL, error) {
 	u, err := url.Parse(base)
-	if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+	if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || strings.Contains(u.Hostname(), "%") {
 		return nil, ErrBadURL
 	}
 	u.Path = strings.TrimRight(u.Path, "/") + wellKnown
