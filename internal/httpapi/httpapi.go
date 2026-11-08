@@ -314,7 +314,9 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request, info *reqInf
 	}
 	admitted = admitted[:grant]
 
-	s.dispatch(r.Context(), parsed, results, admitted)
+	dctx, cancelDispatch := context.WithTimeout(r.Context(), s.requestTimeout())
+	s.dispatch(dctx, parsed, results, admitted)
+	cancelDispatch()
 
 	var okN, invN, errN, rlN int
 	for i, res := range results {
@@ -352,21 +354,40 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request, info *reqInf
 }
 
 // dispatch sends the admitted messages concurrently (bounded) and writes the
-// outcomes into results at their indexes.
+// outcomes into results at their indexes. ctx carries the whole-batch
+// deadline: messages that have not finished (or not started) when it ends are
+// reported as retryable request_deadline errors, so a slow provider cannot
+// hold the response past the server's write timeout.
 func (s *Server) dispatch(ctx context.Context, msgs []push.Message, results []Result, idx []int) {
 	sem := make(chan struct{}, s.Cfg.SendConcurrency)
 	var wg sync.WaitGroup
 	for _, i := range idx {
-		sem <- struct{}{}
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			results[i] = Result{Index: i, Status: push.StatusError, Code: "request_deadline", Retryable: true}
+			continue
+		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
+			// A panicking sender must not take the whole relay down: the
+			// goroutine is not covered by net/http's per-request recover.
+			defer func() {
+				if recover() != nil {
+					s.Log.Error("sender panicked", "error_class", "sender_panic")
+					results[i] = Result{Index: i, Status: push.StatusError, Code: "internal"}
+				}
+			}()
 			m := msgs[i]
 			cctx, cancel := context.WithTimeout(ctx, s.Cfg.SendTimeout)
 			defer cancel()
 			start := time.Now()
 			res := s.Senders.Lookup(m.AppID, m.Kind).Send(cctx, m)
+			if ctx.Err() != nil && res.Status != push.StatusOK && res.Status != push.StatusInvalidToken {
+				res = push.Result{Status: push.StatusError, Code: "request_deadline", Retryable: true}
+			}
 			s.Metrics.ProviderTime.WithLabelValues(string(m.Kind)).Observe(time.Since(start).Seconds())
 			outcome := "ok"
 			switch res.Status {
@@ -481,4 +502,15 @@ func ClientIP(r *http.Request, trusted []netip.Prefix) string {
 		}
 	}
 	return host
+}
+
+// defaultRequestTimeout bounds one /v1/send batch when the config leaves
+// RequestTimeout unset. It stays below the HTTP server's write timeout.
+const defaultRequestTimeout = 60 * time.Second
+
+func (s *Server) requestTimeout() time.Duration {
+	if s.Cfg.RequestTimeout > 0 {
+		return s.Cfg.RequestTimeout
+	}
+	return defaultRequestTimeout
 }

@@ -32,13 +32,18 @@ type fakeSender struct {
 	msgs []push.Message
 }
 
-func (f *fakeSender) Send(_ context.Context, m push.Message) push.Result {
+func (f *fakeSender) Send(ctx context.Context, m push.Message) push.Result {
 	f.mu.Lock()
 	f.msgs = append(f.msgs, m)
 	f.mu.Unlock()
 	switch {
 	case strings.HasPrefix(m.Token, "dead"):
 		return push.Result{Status: push.StatusInvalidToken, Code: "unregistered"}
+	case strings.HasPrefix(m.Token, "slow"):
+		<-ctx.Done()
+		return push.Result{Status: push.StatusError, Code: "provider_unreachable", Retryable: true}
+	case strings.HasPrefix(m.Token, "panic"):
+		panic("sender bug")
 	case strings.HasPrefix(m.Token, "boom"):
 		return push.Result{Status: push.StatusError, Code: "provider_unavailable", Retryable: true}
 	}
@@ -707,5 +712,46 @@ func TestMetricsTokenAndHealthz(t *testing.T) {
 	}
 	if code, body := get(t, ts.URL+"/metrics", "m3trics"); code != 200 || !strings.Contains(body, "relay_http_requests_total") {
 		t.Errorf("with token: %d", code)
+	}
+}
+
+func TestBatchDeadlineBoundsSlowProviderAndKeepsOrder(t *testing.T) {
+	h := newHarness(t, func(c *config.Config) {
+		c.SendConcurrency = 1
+		c.SendTimeout = 5 * time.Second
+		c.RequestTimeout = 300 * time.Millisecond
+	}, nil)
+	start := time.Now()
+	resp, b := h.send(batch(msg("fcm", "slow1", ""), msg("fcm", "slow2", ""), msg("fcm", "slow3", ""), msg("fcm", "okay", "")))
+	if took := time.Since(start); took > 3*time.Second {
+		t.Fatalf("batch took %v; the request deadline did not bound it", took)
+	}
+	if resp.StatusCode != 200 {
+		t.Fatalf("status %d %s", resp.StatusCode, b)
+	}
+	r := decode(t, b)
+	if len(r.Results) != 4 {
+		t.Fatalf("results %+v", r.Results)
+	}
+	for i, res := range r.Results {
+		if res.Index != i || res.Status != push.StatusError || !res.Retryable {
+			t.Errorf("result %d = %+v, want retryable error at index %d", i, res, i)
+		}
+		if res.Code != "request_deadline" {
+			t.Errorf("result %d code %q, want request_deadline", i, res.Code)
+		}
+	}
+}
+
+func TestPanickingSenderIsContained(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	resp, b := h.send(batch(msg("fcm", "okay1", ""), msg("fcm", "panic1", ""), msg("fcm", "okay2", "")))
+	if resp.StatusCode != 200 {
+		t.Fatalf("status %d %s", resp.StatusCode, b)
+	}
+	r := decode(t, b)
+	if r.Results[0].Status != push.StatusOK || r.Results[2].Status != push.StatusOK ||
+		r.Results[1].Status != push.StatusError || r.Results[1].Code != "internal" {
+		t.Errorf("results %+v", r.Results)
 	}
 }

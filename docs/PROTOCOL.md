@@ -68,7 +68,7 @@ Codes by status:
 - `invalid_token`: `unregistered` (FCM `UNREGISTERED`/404, APNs 410 `Unregistered` or `BadDeviceToken`), `invalid_argument_token` (FCM 400 naming `message.token`).
 - `rate_limited`: `rate_limited` (per-server token bucket, default 60 msg/s with burst 600), `quota_exceeded` (daily quota, UTC day). Both are retryable; the daily quota is retryable after 00:00 UTC.
 - `error`, validation: `invalid_message`, `invalid_push_kind`, `invalid_token_format`, `invalid_app_id`, `invalid_priority`, `invalid_ttl`, `invalid_data`, `disallowed_data_key`, `invalid_apns`, `app_not_allowed`, `provider_not_configured`.
-- `error`, provider: `provider_throttled` (retryable), `provider_unavailable` (retryable), `provider_unreachable` (retryable), `provider_auth_failed`, `provider_rejected`, `topic_mismatch` (APNs `DeviceTokenNotForTopic`: a relay configuration problem, deliberately not `invalid_token`), `encode_failed`, `request_failed`, `internal`.
+- `error`, provider: `provider_throttled` (retryable), `provider_unavailable` (retryable), `provider_unreachable` (retryable), `request_deadline` (retryable: the batch deadline `RELAY_REQUEST_TIMEOUT` passed before this message finished; it may or may not have been delivered), `provider_auth_failed`, `provider_rejected`, `topic_mismatch` (APNs `DeviceTokenNotForTopic`: a relay configuration problem, deliberately not `invalid_token`), `encode_failed`, `request_failed`, `internal`.
 
 ## 3. Field semantics
 

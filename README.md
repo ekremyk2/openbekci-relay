@@ -66,6 +66,7 @@ Everything comes from environment variables with the `RELAY_` prefix. Every secr
 | `RELAY_ENROLL_PER_MIN_PER_IP` | `10` | enrollment attempts per client IP per minute |
 | `RELAY_TRUSTED_PROXIES` | empty | comma-separated CIDRs/addresses whose `X-Forwarded-For` is trusted |
 | `RELAY_SEND_TIMEOUT`, `RELAY_SEND_CONCURRENCY` | `10s`, `32` | per-message provider timeout, parallel provider calls |
+| `RELAY_REQUEST_TIMEOUT` | `60s` | deadline for a whole `/v1/send` batch; unfinished messages come back as retryable `request_deadline` errors |
 | `RELAY_METRICS_TOKEN` / `_FILE` | empty | if set, `/metrics` needs `Authorization: Bearer <token>` |
 | `RELAY_DEV_LOG_SENDER` | `false` | route every app to the log sender instead of FCM/APNs |
 

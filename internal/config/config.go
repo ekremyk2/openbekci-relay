@@ -58,7 +58,10 @@ type Config struct {
 
 	MetricsToken string
 
+	// SendTimeout bounds one provider call; RequestTimeout the whole batch of a
+	// /v1/send request (must stay below the HTTP write timeout).
 	SendTimeout     time.Duration
+	RequestTimeout  time.Duration
 	SendConcurrency int
 
 	// DevLogSender routes every app to the log sender instead of FCM/APNs.
@@ -200,6 +203,7 @@ func load(lookup func(string) (string, bool), read func(string) ([]byte, error),
 		ClockSkew:            e.dur("CLOCK_SKEW", 5*time.Minute),
 		EnrollPerMinPerIP:    int(e.int64("ENROLL_PER_MIN_PER_IP", 10)),
 		SendTimeout:          e.dur("SEND_TIMEOUT", 10*time.Second),
+		RequestTimeout:       e.dur("REQUEST_TIMEOUT", 60*time.Second),
 		SendConcurrency:      int(e.int64("SEND_CONCURRENCY", 32)),
 		DevLogSender:         e.boolean("DEV_LOG_SENDER"),
 	}
