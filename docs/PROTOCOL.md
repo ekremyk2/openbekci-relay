@@ -24,6 +24,7 @@ Until the MAC verifies, every failure is the same `401 unauthorized`, so a probe
 | 401 | `unauthorized` | missing/malformed header, unknown server id, wrong MAC, revoked server |
 | 401 | `stale_timestamp` | MAC valid, timestamp outside the window (check the instance clock) |
 | 401 | `replayed_nonce` | MAC valid, nonce already used |
+| 429 | `rate_limited` | MAC valid, but this server is sending requests faster than `RELAY_RATE_PER_SEC`/`RELAY_BURST` allow (checked before the nonce is stored; `Retry-After: 1`; retry with the same or a fresh nonce) |
 | 403 | `server_disabled` | the operator disabled this server (kill switch); retry later, do not hammer |
 | 413 | `payload_too_large` | body over the cap |
 | 400 | `bad_request`, `empty_batch`, `batch_too_large` | malformed JSON, unknown top-level key, no messages, more than `RELAY_MAX_BATCH` (500) messages |

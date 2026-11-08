@@ -54,6 +54,7 @@ type Server struct {
 	Deps
 	mu       sync.Mutex
 	buckets  map[string]*rate.Limiter // per server id
+	reqs     map[string]*rate.Limiter // per server id, authenticated requests
 	enrollIP map[string]*rate.Limiter // per client IP
 }
 
@@ -65,7 +66,7 @@ func New(d Deps) *Server {
 	if d.Verifier == nil {
 		d.Verifier = &enroll.Verifier{}
 	}
-	return &Server{Deps: d, buckets: map[string]*rate.Limiter{}, enrollIP: map[string]*rate.Limiter{}}
+	return &Server{Deps: d, buckets: map[string]*rate.Limiter{}, reqs: map[string]*rate.Limiter{}, enrollIP: map[string]*rate.Limiter{}}
 }
 
 // Handler returns the routed, instrumented handler.
@@ -457,6 +458,12 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request, info *reqI
 		s.fail(w, info, http.StatusUnauthorized, "stale_timestamp", "timestamp outside the accepted window; check the server clock")
 		return store.Server{}, false
 	}
+	if !s.requestLimiter(srv.ID).Allow() {
+		s.Metrics.AuthFailures.WithLabelValues("rate_limited").Inc()
+		w.Header().Set("Retry-After", "1")
+		s.fail(w, info, http.StatusTooManyRequests, "rate_limited", "too many requests for this server")
+		return store.Server{}, false
+	}
 	if err := s.Store.UseNonce(r.Context(), srv.ID, nonce, 2*s.Cfg.ClockSkew); err != nil {
 		if errors.Is(err, store.ErrReplay) {
 			s.Metrics.AuthFailures.WithLabelValues("replay").Inc()
@@ -513,4 +520,20 @@ func (s *Server) requestTimeout() time.Duration {
 		return s.Cfg.RequestTimeout
 	}
 	return defaultRequestTimeout
+}
+
+// requestLimiter bounds authenticated requests per server (same rate and burst
+// as the message bucket, so one request costs at most one message's worth).
+// Every authenticated request stores a nonce row before any other work, so
+// without this a server holding a valid secret could grow the nonce table at
+// wire speed for the whole ten-minute retention.
+func (s *Server) requestLimiter(id string) *rate.Limiter {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	l, ok := s.reqs[id]
+	if !ok {
+		l = rate.NewLimiter(rate.Limit(s.Cfg.RatePerSec), s.Cfg.Burst)
+		s.reqs[id] = l
+	}
+	return l
 }

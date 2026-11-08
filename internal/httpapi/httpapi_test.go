@@ -801,3 +801,26 @@ func TestEnrollRateLimitCannotBeEvadedByRotatingWithinAnIPv6Prefix(t *testing.T)
 		t.Errorf("%d of 6 requests limited, want 4 (2 allowed per prefix)", limited)
 	}
 }
+
+func TestAuthenticatedRequestRateBoundsNonceGrowth(t *testing.T) {
+	h := newHarness(t, func(c *config.Config) { c.Burst = 3; c.RatePerSec = 0.0001 }, nil)
+	var ok, limited int
+	for range 8 {
+		// Empty-batch requests are authentic but cost no message tokens.
+		resp, b := h.send(`{"messages":[]}`)
+		switch resp.StatusCode {
+		case 400:
+			ok++
+		case 429:
+			limited++
+			if errCode(t, b) != "rate_limited" {
+				t.Errorf("429 body %s", b)
+			}
+		default:
+			t.Errorf("status %d %s", resp.StatusCode, b)
+		}
+	}
+	if ok != 3 || limited != 5 {
+		t.Errorf("accepted=%d limited=%d, want 3 and 5", ok, limited)
+	}
+}
