@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
@@ -34,9 +35,6 @@ var ErrReplay = errors.New("store: nonce replayed")
 
 // ErrInviteInvalid is returned when an invite is unknown, used or expired.
 var ErrInviteInvalid = errors.New("store: invite invalid")
-
-// ErrChallengeUsed is returned when an enrollment challenge was already used.
-var ErrChallengeUsed = errors.New("store: challenge already used")
 
 // Server is an enrolled instance.
 type Server struct {
@@ -109,9 +107,15 @@ CREATE TABLE IF NOT EXISTS nonce (
   PRIMARY KEY (server_id, nonce)
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS nonce_expires ON nonce(expires_at);
-CREATE TABLE IF NOT EXISTS challenge_used (
-  hash TEXT PRIMARY KEY,
-  expires_at INTEGER NOT NULL
+CREATE TABLE IF NOT EXISTS pending_enrollment (
+  id TEXT PRIMARY KEY,
+  token_hash TEXT NOT NULL,
+  challenge TEXT NOT NULL,
+  app_id TEXT NOT NULL,
+  invite_hash TEXT NOT NULL DEFAULT '',
+  manual INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0
 ) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS quota (
   server_id TEXT NOT NULL,
@@ -375,16 +379,127 @@ func (s *Store) PeekInvite(ctx context.Context, code string) (Invite, error) {
 	return i, nil
 }
 
+// ErrPendingInvalid is returned when a pending enrollment is unknown, expired,
+// already completed or out of attempts. The cases are deliberately not
+// distinguishable to callers.
+var ErrPendingInvalid = errors.New("store: pending enrollment invalid")
+
+// PendingTTL is how long a begun enrollment can be completed.
+const PendingTTL = 15 * time.Minute
+
+// MaxPendingAttempts is how many failed discovery fetches a pending
+// enrollment survives.
+const MaxPendingAttempts = 5
+
+const (
+	maxPendingPerInvite = 5
+	maxPendingTotal     = 10000
+)
+
+// ErrTooManyPending is returned by BeginEnrollment when the pending table (or
+// the share one invite may hold) is full.
+var ErrTooManyPending = errors.New("store: too many pending enrollments")
+
+// Pending is a begun, not yet completed enrollment.
+type Pending struct {
+	ID         string
+	AppID      string
+	Challenge  string
+	InviteHash string // empty when the mode needs no invite
+	Manual     bool   // the invite was issued as manual
+	ExpiresAt  time.Time
+	Attempts   int
+	tokenHash  string
+}
+
+// BeginEnrollment records a pending enrollment and returns it with its secret
+// enrollment token (shown once, stored only as a hash). The challenge is
+// generated here with 256 bits of entropy; callers never choose it, so it is
+// a secret known only to whoever holds the token until the instance publishes
+// it. inviteCode may be empty.
+func (s *Store) BeginEnrollment(ctx context.Context, appID, inviteCode string, manual bool) (Pending, string, error) {
+	now := s.now()
+	p := Pending{
+		ID: "enr_" + hex.EncodeToString(mustRand(8)), AppID: appID, Challenge: "obk_ch_" + randString(32),
+		Manual: manual, ExpiresAt: now.Add(PendingTTL).UTC(),
+	}
+	if inviteCode != "" {
+		p.InviteHash = hash(inviteCode)
+	}
+	token := "obk_et_" + randString(32)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return p, "", err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM pending_enrollment WHERE expires_at<=?`, now.Unix()); err != nil {
+		return p, "", err
+	}
+	var total, perInvite int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(invite_hash=? AND invite_hash<>''),0) FROM pending_enrollment`, p.InviteHash).Scan(&total, &perInvite); err != nil {
+		return p, "", err
+	}
+	if total >= maxPendingTotal || perInvite >= maxPendingPerInvite {
+		return p, "", ErrTooManyPending
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO pending_enrollment(id,token_hash,challenge,app_id,invite_hash,manual,expires_at,attempts) VALUES(?,?,?,?,?,?,?,0)`,
+		p.ID, hash(token), p.Challenge, appID, p.InviteHash, b2i(manual), p.ExpiresAt.Unix()); err != nil {
+		return p, "", err
+	}
+	return p, token, tx.Commit()
+}
+
+// OpenPending returns the pending enrollment id when token is its token and it
+// is unexpired and has attempts left; otherwise ErrPendingInvalid. The token
+// hash is compared in constant time.
+func (s *Store) OpenPending(ctx context.Context, id, token string) (Pending, error) {
+	var p Pending
+	var man int
+	var exp int64
+	err := s.db.QueryRowContext(ctx, `SELECT id,token_hash,challenge,app_id,invite_hash,manual,expires_at,attempts FROM pending_enrollment WHERE id=?`, id).
+		Scan(&p.ID, &p.tokenHash, &p.Challenge, &p.AppID, &p.InviteHash, &man, &exp, &p.Attempts)
+	if errors.Is(err, sql.ErrNoRows) {
+		// Burn comparable time so unknown ids are not distinguishable.
+		_ = subtle.ConstantTimeCompare([]byte(hash(token)), []byte(hash(id)))
+		return Pending{}, ErrPendingInvalid
+	}
+	if err != nil {
+		return Pending{}, err
+	}
+	if subtle.ConstantTimeCompare([]byte(hash(token)), []byte(p.tokenHash)) != 1 {
+		return Pending{}, ErrPendingInvalid
+	}
+	p.Manual = man == 1
+	p.ExpiresAt = time.Unix(exp, 0).UTC()
+	if !s.now().Before(p.ExpiresAt) || p.Attempts >= MaxPendingAttempts {
+		return Pending{}, ErrPendingInvalid
+	}
+	return p, nil
+}
+
+// ConsumeAttempt counts one discovery attempt against a pending enrollment
+// (atomically, so concurrent completions cannot exceed the bound). It returns
+// ErrPendingInvalid when none are left.
+func (s *Store) ConsumeAttempt(ctx context.Context, id string) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE pending_enrollment SET attempts=attempts+1 WHERE id=? AND attempts<? AND expires_at>?`, id, MaxPendingAttempts, s.now().Unix())
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrPendingInvalid
+	}
+	return nil
+}
+
 // EnrollParams carries what an enrollment commit needs.
 type EnrollParams struct {
 	NewServerParams
-	InviteCode    string // empty when the mode needs none
-	ChallengeHash string // empty for manual enrollments
-	ChallengeTTL  time.Duration
+	InviteHash string // empty when the mode needs none
+	PendingID  string // the pending enrollment this completes
 }
 
-// CommitEnrollment atomically consumes the invite (when given), records the
-// challenge as used (when given) and creates the server.
+// CommitEnrollment atomically consumes the pending enrollment (so it can be
+// completed once), consumes the invite (when given) and creates the server.
 func (s *Store) CommitEnrollment(ctx context.Context, p EnrollParams) (Server, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -392,9 +507,18 @@ func (s *Store) CommitEnrollment(ctx context.Context, p EnrollParams) (Server, e
 	}
 	defer func() { _ = tx.Rollback() }()
 	now := s.now()
-	if p.InviteCode != "" {
+	if p.PendingID != "" {
+		res, err := tx.ExecContext(ctx, `DELETE FROM pending_enrollment WHERE id=? AND expires_at>?`, p.PendingID, now.Unix())
+		if err != nil {
+			return Server{}, err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return Server{}, ErrPendingInvalid
+		}
+	}
+	if p.InviteHash != "" {
 		res, err := tx.ExecContext(ctx, `UPDATE invite SET used_at=?, used_by=? WHERE code_hash=? AND used_at IS NULL AND expires_at>?`,
-			now.Unix(), p.AppID, hash(p.InviteCode), now.Unix())
+			now.Unix(), p.AppID, p.InviteHash, now.Unix())
 		if err != nil {
 			return Server{}, err
 		}
@@ -402,32 +526,20 @@ func (s *Store) CommitEnrollment(ctx context.Context, p EnrollParams) (Server, e
 			return Server{}, ErrInviteInvalid
 		}
 	}
-	if p.ChallengeHash != "" {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM challenge_used WHERE expires_at<=?`, now.Unix()); err != nil {
-			return Server{}, err
-		}
-		res, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO challenge_used(hash,expires_at) VALUES(?,?)`, p.ChallengeHash, now.Add(p.ChallengeTTL).Unix())
-		if err != nil {
-			return Server{}, err
-		}
-		if n, _ := res.RowsAffected(); n == 0 {
-			return Server{}, ErrChallengeUsed
-		}
-	}
 	srv, err := createServer(ctx, tx, now, p.NewServerParams)
 	if err != nil {
 		return Server{}, err
 	}
-	if p.InviteCode != "" {
-		if _, err := tx.ExecContext(ctx, `UPDATE invite SET used_by=? WHERE code_hash=?`, srv.ID, hash(p.InviteCode)); err != nil {
+	if p.InviteHash != "" {
+		if _, err := tx.ExecContext(ctx, `UPDATE invite SET used_by=? WHERE code_hash=?`, srv.ID, p.InviteHash); err != nil {
 			return Server{}, err
 		}
 	}
 	return srv, tx.Commit()
 }
 
-// ChallengeHash is the value stored for a used challenge.
-func ChallengeHash(challenge string) string { return hash(challenge) }
+// InviteHash is the stored form of an invite code.
+func InviteHash(code string) string { return hash(code) }
 
 // UseNonce records a nonce, returning ErrReplay if already present.
 func (s *Store) UseNonce(ctx context.Context, serverID, nonce string, ttl time.Duration) error {
@@ -441,13 +553,13 @@ func (s *Store) UseNonce(ctx context.Context, serverID, nonce string, ttl time.D
 	return nil
 }
 
-// Purge deletes expired nonces and challenges.
+// Purge deletes expired nonces and pending enrollments.
 func (s *Store) Purge(ctx context.Context) error {
 	now := s.now().Unix()
 	if _, err := s.db.ExecContext(ctx, `DELETE FROM nonce WHERE expires_at<=?`, now); err != nil {
 		return err
 	}
-	_, err := s.db.ExecContext(ctx, `DELETE FROM challenge_used WHERE expires_at<=?`, now)
+	_, err := s.db.ExecContext(ctx, `DELETE FROM pending_enrollment WHERE expires_at<=?`, now)
 	return err
 }
 

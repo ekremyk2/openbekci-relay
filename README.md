@@ -97,7 +97,7 @@ The instance administrator then runs, on the server (backend 0.4):
 openbekci admin push-relay enroll --relay official --url https://push.example.org --secret-file /run/secrets/relay_secret --invite obk_inv_...
 ```
 
-The server publishes an ephemeral challenge in its discovery document, calls `POST /v1/enrollments`, and the relay fetches `https://<server>/.well-known/openbekci.json` under SSRF guards to check it. The command writes the returned secret to the file (mode 600) and prints the `OPENBEKCI_PUSH_RELAYS` entry: `relay_id=url;server_id;secret_file;app_id`. For LAN-only instances the relay cannot reach, issue the invite with `--manual` and enroll with `--manual`: the server is stored unverified with the lower default quota.
+Enrollment has two steps. `POST /v1/enrollments/begin` (app id, invite) returns an `enrollment_id`, a secret `enrollment_token` and a relay-generated `challenge`; the server publishes the challenge in its discovery document; `POST /v1/enrollments/complete` (id, token, base URL) makes the relay fetch `https://<server>/.well-known/openbekci.json` under SSRF guards, check the challenge and, only for the holder of the token, return the secret. Knowing the (public) challenge is not enough to enroll. The command writes the returned secret to the file (mode 600) and prints the `OPENBEKCI_PUSH_RELAYS` entry: `relay_id=url;server_id;secret_file;app_id`. For LAN-only instances the relay cannot reach, issue the invite with `--manual` and enroll with `--manual`: the server is stored unverified with the lower default quota.
 
 **Operator-provisioned.** Skip enrollment and issue the credentials directly (the secret is printed once):
 
@@ -128,7 +128,7 @@ openbekci-relay admin servers revoke srv_...      # final: the secret is destroy
 
 ## API in one screen
 
-`POST /v1/send` with `Authorization: Relay-HMAC <server_id>:<ts>:<nonce>:<hex hmac-sha256(secret, ts "." nonce "." sha256(body))>` and `{"messages":[{push_kind, token, app_id, priority, ttl_seconds, data, apns}]}`; the response is `{"results":[{index, status: ok|invalid_token|rate_limited|error, code?, retryable?}]}`. `POST /v1/enrollments` for enrollment. Details and every interpretation: [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
+`POST /v1/send` with `Authorization: Relay-HMAC <server_id>:<ts>:<nonce>:<hex hmac-sha256(secret, ts "." nonce "." sha256(body))>` and `{"messages":[{push_kind, token, app_id, priority, ttl_seconds, data, apns}]}`; the response is `{"results":[{index, status: ok|invalid_token|rate_limited|error, code?, retryable?}]}`. `POST /v1/enrollments/begin` and `/complete` for enrollment. Details and every interpretation: [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
 
 ## Tests
 

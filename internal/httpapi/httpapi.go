@@ -1,5 +1,5 @@
 // Package httpapi is the relay's HTTP surface: POST /v1/send (HMAC), POST
-// /v1/enrollments, /healthz and /metrics.
+// /v1/enrollments/begin and /complete, /healthz and /metrics.
 package httpapi
 
 import (
@@ -73,7 +73,8 @@ func New(d Deps) *Server {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("POST /v1/send", s.wrap("send", s.handleSend))
-	mux.Handle("POST /v1/enrollments", s.wrap("enroll", s.handleEnroll))
+	mux.Handle("POST /v1/enrollments/begin", s.wrap("enroll_begin", s.handleEnrollBegin))
+	mux.Handle("POST /v1/enrollments/complete", s.wrap("enroll_complete", s.handleEnrollComplete))
 	mux.Handle("GET /healthz", s.wrap("healthz", s.handleHealthz))
 	mux.Handle("GET /metrics", s.wrap("metrics", s.handleMetrics))
 	return mux

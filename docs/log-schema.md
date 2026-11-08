@@ -10,7 +10,7 @@ Common fields on every line: `time`, `level`, `msg`.
 
 | Field | Type | Present | Meaning |
 | --- | --- | --- | --- |
-| `route` | string | always | `send` or `enroll` |
+| `route` | string | always | `send`, `enroll_begin` or `enroll_complete` |
 | `status` | int | always | HTTP status returned |
 | `duration_ms` | int | always | handling time |
 | `server_id` | string | when authenticated or enrolled | `srv_...` |

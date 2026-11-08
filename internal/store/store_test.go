@@ -75,14 +75,14 @@ func TestInviteIsOneShotAndHashed(t *testing.T) {
 	if err := s.db.QueryRow(`SELECT code_hash FROM invite WHERE id=?`, inv.ID).Scan(&stored); err != nil || stored == code {
 		t.Errorf("plaintext code stored: %q %v", stored, err)
 	}
-	srv, err := s.CommitEnrollment(ctx, EnrollParams{NewServerParams: NewServerParams{AppID: "a", DailyQuota: 1}, InviteCode: code})
+	srv, err := s.CommitEnrollment(ctx, EnrollParams{NewServerParams: NewServerParams{AppID: "a", DailyQuota: 1}, InviteHash: InviteHash(code)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.PeekInvite(ctx, code); !errors.Is(err, ErrInviteInvalid) {
 		t.Error("used invite still valid")
 	}
-	if _, err := s.CommitEnrollment(ctx, EnrollParams{NewServerParams: NewServerParams{AppID: "a"}, InviteCode: code}); !errors.Is(err, ErrInviteInvalid) {
+	if _, err := s.CommitEnrollment(ctx, EnrollParams{NewServerParams: NewServerParams{AppID: "a"}, InviteHash: InviteHash(code)}); !errors.Is(err, ErrInviteInvalid) {
 		t.Errorf("second use: %v", err)
 	}
 	if l, _ := s.ListServers(ctx); len(l) != 1 || l[0].ID != srv.ID {
@@ -103,18 +103,6 @@ func TestInviteIsOneShotAndHashed(t *testing.T) {
 	now.Add(61)
 	if _, err := s.PeekInvite(ctx, code3); !errors.Is(err, ErrInviteInvalid) {
 		t.Error("expired invite valid")
-	}
-}
-
-func TestChallengeUsedOnce(t *testing.T) {
-	s, _ := open(t)
-	ctx := t.Context()
-	p := EnrollParams{NewServerParams: NewServerParams{AppID: "a"}, ChallengeHash: ChallengeHash("c"), ChallengeTTL: time.Hour}
-	if _, err := s.CommitEnrollment(ctx, p); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.CommitEnrollment(ctx, p); !errors.Is(err, ErrChallengeUsed) {
-		t.Errorf("%v", err)
 	}
 }
 
@@ -209,5 +197,91 @@ func TestPersistsAcrossReopen(t *testing.T) {
 	defer func() { _ = s2.Close() }()
 	if got, err := s2.Server(t.Context(), srv.ID); err != nil || got.Secret != srv.Secret {
 		t.Errorf("%+v %v", got, err)
+	}
+}
+
+func TestPendingEnrollment(t *testing.T) {
+	s, now := open(t)
+	ctx := t.Context()
+	code, _, _ := s.CreateInvite(ctx, false, "", time.Hour)
+	p, tok, err := s.BeginEnrollment(ctx, "app", code, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Challenge) < 7+43 || p.Challenge == tok {
+		t.Errorf("challenge %q", p.Challenge)
+	}
+	var stored string
+	if err := s.db.QueryRow(`SELECT token_hash FROM pending_enrollment WHERE id=?`, p.ID).Scan(&stored); err != nil || stored == tok {
+		t.Errorf("token stored in clear: %q %v", stored, err)
+	}
+	// Wrong token, wrong id: indistinguishable.
+	if _, err := s.OpenPending(ctx, p.ID, "obk_et_wrong"); !errors.Is(err, ErrPendingInvalid) {
+		t.Errorf("wrong token: %v", err)
+	}
+	if _, err := s.OpenPending(ctx, "enr_nope", tok); !errors.Is(err, ErrPendingInvalid) {
+		t.Errorf("unknown id: %v", err)
+	}
+	got, err := s.OpenPending(ctx, p.ID, tok)
+	if err != nil || got.Challenge != p.Challenge || got.AppID != "app" {
+		t.Fatalf("%+v %v", got, err)
+	}
+	// Completion is single use.
+	ep := EnrollParams{NewServerParams: NewServerParams{AppID: "app"}, InviteHash: InviteHash(code), PendingID: p.ID}
+	if _, err := s.CommitEnrollment(ctx, ep); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CommitEnrollment(ctx, ep); !errors.Is(err, ErrPendingInvalid) {
+		t.Errorf("second completion: %v", err)
+	}
+	if _, err := s.OpenPending(ctx, p.ID, tok); !errors.Is(err, ErrPendingInvalid) {
+		t.Error("completed enrollment still open")
+	}
+	// Attempts are bounded.
+	p2, tok2, _ := s.BeginEnrollment(ctx, "app", "", false)
+	for range MaxPendingAttempts {
+		if err := s.ConsumeAttempt(ctx, p2.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.ConsumeAttempt(ctx, p2.ID); !errors.Is(err, ErrPendingInvalid) {
+		t.Errorf("attempt beyond bound: %v", err)
+	}
+	if _, err := s.OpenPending(ctx, p2.ID, tok2); !errors.Is(err, ErrPendingInvalid) {
+		t.Error("exhausted enrollment still open")
+	}
+	// Expiry.
+	p3, tok3, _ := s.BeginEnrollment(ctx, "app", "", false)
+	now.Add(int64(PendingTTL/time.Second) + 1)
+	if _, err := s.OpenPending(ctx, p3.ID, tok3); !errors.Is(err, ErrPendingInvalid) {
+		t.Error("expired enrollment open")
+	}
+	if _, err := s.CommitEnrollment(ctx, EnrollParams{NewServerParams: NewServerParams{AppID: "app"}, PendingID: p3.ID}); !errors.Is(err, ErrPendingInvalid) {
+		t.Errorf("commit after expiry: %v", err)
+	}
+	if err := s.Purge(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	_ = s.db.QueryRow(`SELECT COUNT(*) FROM pending_enrollment`).Scan(&n)
+	if n != 0 {
+		t.Errorf("%d pending rows survive purge", n)
+	}
+}
+
+func TestPendingPerInviteBound(t *testing.T) {
+	s, _ := open(t)
+	ctx := t.Context()
+	code, _, _ := s.CreateInvite(ctx, false, "", time.Hour)
+	for range maxPendingPerInvite {
+		if _, _, err := s.BeginEnrollment(ctx, "app", code, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, err := s.BeginEnrollment(ctx, "app", code, false); !errors.Is(err, ErrTooManyPending) {
+		t.Errorf("%v", err)
+	}
+	if _, _, err := s.BeginEnrollment(ctx, "app", "", false); err != nil {
+		t.Errorf("inviteless begin blocked by an invite's bound: %v", err)
 	}
 }

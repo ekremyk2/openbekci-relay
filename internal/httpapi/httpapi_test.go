@@ -530,48 +530,107 @@ func TestLogsAndMetricsAreContentFree(t *testing.T) {
 	}
 }
 
-func TestEnrollment(t *testing.T) {
-	var verified []string
-	verify := verifierFunc(func(_ context.Context, base, challenge string) error {
-		verified = append(verified, base)
-		if challenge != "good-challenge-0123456789" {
-			return enroll.ErrMismatch
-		}
-		return nil
-	})
-	h := newHarness(t, nil, verify)
-	ctx := context.Background()
-	doEnroll := func(body string) (*reply, []byte) {
-		resp, err := http.Post(h.ts.URL+"/v1/enrollments", "application/json", strings.NewReader(body))
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer func() { _ = resp.Body.Close() }()
-		b, _ := io.ReadAll(resp.Body)
-		return &reply{StatusCode: resp.StatusCode}, b
+// published simulates instances' discovery documents: base URL -> challenge.
+type published struct {
+	mu sync.Mutex
+	m  map[string]string
+	n  int // fetches
+}
+
+func (p *published) publish(base, challenge string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.m == nil {
+		p.m = map[string]string{}
 	}
-	req := func(code, challenge string, manual bool) string {
-		b, _ := json.Marshal(map[string]any{"base_url": "https://bekci.example.org", "challenge": challenge, "app_id": appID, "invite_code": code, "manual": manual})
-		return string(b)
+	p.m[base] = challenge
+}
+
+func (p *published) Verify(_ context.Context, base, challenge string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.n++
+	got, ok := p.m[base]
+	if !ok {
+		return enroll.ErrUnreachable
+	}
+	if got != challenge {
+		return enroll.ErrMismatch
+	}
+	return nil
+}
+
+func (p *published) fetches() int { p.mu.Lock(); defer p.mu.Unlock(); return p.n }
+
+func postJSON(t *testing.T, url string, v any) (*reply, []byte) {
+	t.Helper()
+	b, _ := json.Marshal(v)
+	resp, err := http.Post(url, "application/json", bytes.NewReader(b))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	out, _ := io.ReadAll(resp.Body)
+	return &reply{StatusCode: resp.StatusCode}, out
+}
+
+const bekci = "https://bekci.example.org"
+
+func TestEnrollment(t *testing.T) {
+	pub := &published{}
+	h := newHarness(t, func(c *config.Config) { c.EnrollPerMinPerIP = 1000 }, pub)
+	ctx := context.Background()
+	begin := func(h *harness, code string) (*reply, httpapi.BeginResponse, []byte) {
+		resp, b := postJSON(t, h.ts.URL+"/v1/enrollments/begin", map[string]any{"app_id": appID, "invite_code": code})
+		var br httpapi.BeginResponse
+		_ = json.Unmarshal(b, &br)
+		return resp, br, b
+	}
+	complete := func(h *harness, id, token, base string, manual bool) (*reply, []byte) {
+		return postJSON(t, h.ts.URL+"/v1/enrollments/complete", map[string]any{"enrollment_id": id, "enrollment_token": token, "base_url": base, "manual": manual})
+	}
+	newInvite := func(manual bool, ttl time.Duration) string {
+		code, _, _ := h.st.CreateInvite(ctx, manual, "", ttl)
+		return code
 	}
 
 	t.Run("invite required by default", func(t *testing.T) {
-		resp, b := doEnroll(req("", "good-challenge-0123456789", false))
+		resp, _, b := begin(h, "")
 		if resp.StatusCode != 403 || errCode(t, b) != "invite_required" {
 			t.Errorf("%d %s", resp.StatusCode, b)
 		}
 	})
 	t.Run("unknown app", func(t *testing.T) {
-		code, _, _ := h.st.CreateInvite(ctx, false, "", time.Hour)
-		b, _ := json.Marshal(map[string]any{"base_url": "https://x.example", "challenge": "good-challenge-0123456789", "app_id": "nope", "invite_code": code})
-		resp, body := doEnroll(string(b))
-		if resp.StatusCode != 400 || errCode(t, body) != "unknown_app_id" {
-			t.Errorf("%d %s", resp.StatusCode, body)
+		resp, b := postJSON(t, h.ts.URL+"/v1/enrollments/begin", map[string]any{"app_id": "nope", "invite_code": newInvite(false, time.Hour)})
+		if resp.StatusCode != 400 || errCode(t, b) != "unknown_app_id" {
+			t.Errorf("%d %s", resp.StatusCode, b)
 		}
 	})
-	t.Run("happy path then invite and challenge are one-shot, secret signs sends", func(t *testing.T) {
-		code, _, _ := h.st.CreateInvite(ctx, false, "", time.Hour)
-		resp, b := doEnroll(req(code, "good-challenge-0123456789", false))
+	t.Run("old one-step endpoint is gone", func(t *testing.T) {
+		resp, _ := postJSON(t, h.ts.URL+"/v1/enrollments", map[string]any{"base_url": bekci})
+		if resp.StatusCode != 404 && resp.StatusCode != 405 {
+			t.Errorf("status %d", resp.StatusCode)
+		}
+	})
+	t.Run("begin issues a relay-made challenge and does not burn the invite", func(t *testing.T) {
+		code := newInvite(false, time.Hour)
+		resp, br, b := begin(h, code)
+		if resp.StatusCode != 201 || !strings.HasPrefix(br.EnrollmentID, "enr_") || !strings.HasPrefix(br.EnrollmentToken, "obk_et_") || len(br.Challenge) < 32 || br.ExpiresAt == "" {
+			t.Fatalf("%d %s", resp.StatusCode, b)
+		}
+		_, br2, _ := begin(h, code)
+		if br2.Challenge == br.Challenge || br2.EnrollmentToken == br.EnrollmentToken {
+			t.Error("challenge or token repeated")
+		}
+		if _, err := h.st.PeekInvite(ctx, code); err != nil {
+			t.Errorf("invite burned by begin: %v", err)
+		}
+	})
+	t.Run("happy path; secret signs sends; token and invite are single use", func(t *testing.T) {
+		code := newInvite(false, time.Hour)
+		_, br, _ := begin(h, code)
+		pub.publish(bekci, br.Challenge)
+		resp, b := complete(h, br.EnrollmentID, br.EnrollmentToken, bekci, false)
 		if resp.StatusCode != 201 {
 			t.Fatalf("%d %s", resp.StatusCode, b)
 		}
@@ -580,28 +639,47 @@ func TestEnrollment(t *testing.T) {
 		if !strings.HasPrefix(er.ServerID, "srv_") || er.ServerSecret == "" || !er.Verified {
 			t.Fatalf("response %+v", er)
 		}
-		// Reuse the same invite: refused.
-		if resp, b := doEnroll(req(code, "good-challenge-0123456789", false)); resp.StatusCode != 403 || errCode(t, b) != "invite_invalid" {
+		if resp, b := complete(h, br.EnrollmentID, br.EnrollmentToken, bekci, false); resp.StatusCode != 403 || errCode(t, b) != "enrollment_invalid" {
+			t.Errorf("token reuse: %d %s", resp.StatusCode, b)
+		}
+		if resp, _, b := begin(h, code); resp.StatusCode != 403 || errCode(t, b) != "invite_invalid" {
 			t.Errorf("invite reuse: %d %s", resp.StatusCode, b)
 		}
-		// Same challenge with a fresh invite: refused (a session closes once used).
-		code2, _, _ := h.st.CreateInvite(ctx, false, "", time.Hour)
-		if resp, b := doEnroll(req(code2, "good-challenge-0123456789", false)); resp.StatusCode != 409 || errCode(t, b) != "challenge_used" {
-			t.Errorf("challenge reuse: %d %s", resp.StatusCode, b)
-		}
-		// The issued secret works on /v1/send.
 		h.srv = store.Server{ID: er.ServerID, Secret: er.ServerSecret}
 		if resp, b := h.send(batch(msg("fcm", "tok", ""))); resp.StatusCode != 200 {
 			t.Errorf("send with issued secret: %d %s", resp.StatusCode, b)
 		}
 		srv, _ := h.st.Server(ctx, er.ServerID)
-		if srv.DailyQuota != h.cfg.DailyQuota || !srv.Verified || srv.AppID != appID {
+		if srv.DailyQuota != h.cfg.DailyQuota || !srv.Verified || srv.AppID != appID || srv.BaseURL != bekci {
 			t.Errorf("stored server %+v", srv)
 		}
 	})
-	t.Run("challenge mismatch does not burn the invite", func(t *testing.T) {
-		code, _, _ := h.st.CreateInvite(ctx, false, "", time.Hour)
-		resp, b := doEnroll(req(code, "wrong-challenge-012345678", false))
+	t.Run("a third party who only knows the public challenge cannot complete", func(t *testing.T) {
+		_, br, _ := begin(h, newInvite(false, time.Hour))
+		const victim = "https://victim.example.org"
+		pub.publish(victim, br.Challenge) // the instance published it: anyone can read it
+		before := pub.fetches()
+		for _, tok := range []string{"", "obk_et_guess", br.Challenge, strings.Repeat("x", 500)} {
+			resp, b := complete(h, br.EnrollmentID, tok, victim, false)
+			if resp.StatusCode != 403 || errCode(t, b) != "enrollment_invalid" || strings.Contains(string(b), "server_secret") {
+				t.Errorf("token %q: %d %s", tok, resp.StatusCode, b)
+			}
+		}
+		if resp, b := complete(h, "enr_unknown", "obk_et_x", victim, false); resp.StatusCode != 403 || errCode(t, b) != "enrollment_invalid" {
+			t.Errorf("unknown id: %d %s", resp.StatusCode, b)
+		}
+		if pub.fetches() != before {
+			t.Error("relay fetched on behalf of a caller without the token")
+		}
+		if resp, b := complete(h, br.EnrollmentID, br.EnrollmentToken, victim, false); resp.StatusCode != 201 {
+			t.Errorf("holder: %d %s", resp.StatusCode, b)
+		}
+	})
+	t.Run("token holder cannot enroll a base_url that does not publish the challenge", func(t *testing.T) {
+		code := newInvite(false, time.Hour)
+		_, br, _ := begin(h, code)
+		pub.publish("https://other.example.org", "something-else-entirely")
+		resp, b := complete(h, br.EnrollmentID, br.EnrollmentToken, "https://other.example.org", false)
 		if resp.StatusCode != 422 || errCode(t, b) != "challenge_mismatch" {
 			t.Errorf("%d %s", resp.StatusCode, b)
 		}
@@ -609,70 +687,91 @@ func TestEnrollment(t *testing.T) {
 			t.Errorf("invite burned: %v", err)
 		}
 	})
-	t.Run("expired invite", func(t *testing.T) {
-		code, _, _ := h.st.CreateInvite(ctx, false, "", time.Minute)
+	t.Run("failed fetches leave it pending but only a bounded number of times", func(t *testing.T) {
+		_, br, _ := begin(h, newInvite(false, time.Hour))
+		for i := range store.MaxPendingAttempts {
+			resp, b := complete(h, br.EnrollmentID, br.EnrollmentToken, "https://not-yet.example.org", false)
+			if resp.StatusCode != 422 || errCode(t, b) != "discovery_unreachable" {
+				t.Fatalf("attempt %d: %d %s", i, resp.StatusCode, b)
+			}
+		}
+		pub.publish("https://not-yet.example.org", br.Challenge)
+		if resp, b := complete(h, br.EnrollmentID, br.EnrollmentToken, "https://not-yet.example.org", false); resp.StatusCode != 403 || errCode(t, b) != "enrollment_invalid" {
+			t.Errorf("after the bound: %d %s", resp.StatusCode, b)
+		}
+	})
+	t.Run("expiry", func(t *testing.T) {
+		_, br, _ := begin(h, newInvite(false, 3*time.Hour))
+		pub.publish("https://late.example.org", br.Challenge)
+		h.now.Add(int64(store.PendingTTL/time.Second) + 1)
+		if resp, b := complete(h, br.EnrollmentID, br.EnrollmentToken, "https://late.example.org", false); resp.StatusCode != 403 || errCode(t, b) != "enrollment_invalid" {
+			t.Errorf("%d %s", resp.StatusCode, b)
+		}
+	})
+	t.Run("expired invite is refused at begin", func(t *testing.T) {
+		code := newInvite(false, time.Minute)
 		h.now.Add(120)
-		resp, b := doEnroll(req(code, "good-challenge-0123456789", false))
-		if resp.StatusCode != 403 || errCode(t, b) != "invite_invalid" {
+		if resp, _, b := begin(h, code); resp.StatusCode != 403 || errCode(t, b) != "invite_invalid" {
 			t.Errorf("%d %s", resp.StatusCode, b)
 		}
 	})
 	t.Run("manual needs a manual invite and skips the fetch", func(t *testing.T) {
-		n := len(verified)
-		plain, _, _ := h.st.CreateInvite(ctx, false, "", time.Hour)
-		if resp, b := doEnroll(req(plain, "", true)); resp.StatusCode != 403 || errCode(t, b) != "invite_not_manual" {
+		_, brp, _ := begin(h, newInvite(false, time.Hour))
+		if resp, b := complete(h, brp.EnrollmentID, brp.EnrollmentToken, "", true); resp.StatusCode != 403 || errCode(t, b) != "invite_not_manual" {
 			t.Errorf("%d %s", resp.StatusCode, b)
 		}
-		man, _, _ := h.st.CreateInvite(ctx, true, "lan", time.Hour)
-		resp, b := doEnroll(req(man, "", true))
+		n := pub.fetches()
+		_, brm, _ := begin(h, newInvite(true, time.Hour))
+		resp, b := complete(h, brm.EnrollmentID, brm.EnrollmentToken, "", true)
 		if resp.StatusCode != 201 {
 			t.Fatalf("%d %s", resp.StatusCode, b)
 		}
 		var er httpapi.EnrollResponse
 		_ = json.Unmarshal(b, &er)
-		if er.Verified || len(verified) != n {
-			t.Errorf("manual enrollment verified=%v fetches=%d", er.Verified, len(verified)-n)
+		if er.Verified || pub.fetches() != n {
+			t.Errorf("manual enrollment verified=%v fetches=%d", er.Verified, pub.fetches()-n)
 		}
 		srv, _ := h.st.Server(ctx, er.ServerID)
 		if srv.Verified || srv.DailyQuota != 5 {
 			t.Errorf("unverified server %+v", srv)
 		}
+		_, brm2, _ := begin(h, newInvite(true, time.Hour))
+		if resp, _ := complete(h, brm2.EnrollmentID, "obk_et_nope", "", true); resp.StatusCode != 403 {
+			t.Errorf("manual without token: %d", resp.StatusCode)
+		}
 	})
 	t.Run("closed", func(t *testing.T) {
-		hc := newHarness(t, func(c *config.Config) { c.Enrollment = config.EnrollClosed }, verify)
-		resp, err := http.Post(hc.ts.URL+"/v1/enrollments", "application/json", strings.NewReader(req("x", "good-challenge-0123456789", false)))
-		if err != nil {
-			t.Fatal(err)
+		hc := newHarness(t, func(c *config.Config) { c.Enrollment = config.EnrollClosed }, pub)
+		if resp, _, _ := begin(hc, "x"); resp.StatusCode != 403 {
+			t.Errorf("closed begin: %d", resp.StatusCode)
 		}
-		_ = resp.Body.Close()
-		if resp.StatusCode != 403 {
-			t.Errorf("closed: %d", resp.StatusCode)
+		if resp, b := complete(hc, "enr_x", "obk_et_x", bekci, false); resp.StatusCode != 403 || errCode(t, b) != "enrollment_closed" {
+			t.Errorf("closed complete: %d %s", resp.StatusCode, b)
 		}
 	})
 	t.Run("open mode needs no invite", func(t *testing.T) {
-		ho := newHarness(t, func(c *config.Config) { c.Enrollment = config.EnrollOpen }, verify)
-		resp, err := http.Post(ho.ts.URL+"/v1/enrollments", "application/json", strings.NewReader(req("", "good-challenge-0123456789", false)))
-		if err != nil {
-			t.Fatal(err)
-		}
-		_ = resp.Body.Close()
+		ho := newHarness(t, func(c *config.Config) { c.Enrollment = config.EnrollOpen }, pub)
+		resp, br, b := begin(ho, "")
 		if resp.StatusCode != 201 {
-			t.Errorf("open: %d", resp.StatusCode)
+			t.Fatalf("open begin: %d %s", resp.StatusCode, b)
+		}
+		pub.publish("https://open.example.org", br.Challenge)
+		if resp, b := complete(ho, br.EnrollmentID, br.EnrollmentToken, "https://open.example.org", false); resp.StatusCode != 201 {
+			t.Errorf("open complete: %d %s", resp.StatusCode, b)
 		}
 	})
-	t.Run("per IP limit", func(t *testing.T) {
-		hl := newHarness(t, func(c *config.Config) { c.EnrollPerMinPerIP = 2 }, verify)
+	t.Run("per IP limit applies to both steps", func(t *testing.T) {
+		hl := newHarness(t, func(c *config.Config) { c.EnrollPerMinPerIP = 2 }, pub)
 		var last int
-		for range 4 {
-			resp, err := http.Post(hl.ts.URL+"/v1/enrollments", "application/json", strings.NewReader(req("", "x", false)))
-			if err != nil {
-				t.Fatal(err)
-			}
-			_ = resp.Body.Close()
-			last = resp.StatusCode
+		for range 3 {
+			r, _, _ := begin(hl, "")
+			last = r.StatusCode
 		}
 		if last != 429 {
-			t.Errorf("fourth attempt: %d", last)
+			t.Errorf("third begin: %d", last)
+		}
+		if resp, _ := complete(hl, "enr_x", "obk_et_x", bekci, false); resp.StatusCode != 429 {
+			t.Errorf("complete shares the budget: %d", resp.StatusCode)
 		}
 	})
 }
@@ -785,7 +884,7 @@ func TestEnrollRateLimitCannotBeEvadedByRotatingWithinAnIPv6Prefix(t *testing.T)
 	}, nil)
 	var limited int
 	for i := range 6 {
-		req, _ := http.NewRequest(http.MethodPost, h.ts.URL+"/v1/enrollments", strings.NewReader(`{}`))
+		req, _ := http.NewRequest(http.MethodPost, h.ts.URL+"/v1/enrollments/begin", strings.NewReader(`{}`))
 		// Same /64, a new address (and a new spelling) every time.
 		req.Header.Set("X-Forwarded-For", "2001:db8:aa:bb::"+strconv.Itoa(i+1))
 		resp, err := http.DefaultClient.Do(req)
