@@ -37,6 +37,7 @@ type fakeGoogle struct {
 	sendStatus func(call int) (int, string)
 	sendCalls  atomic.Int32
 	tokenHang  chan struct{} // when set, the token endpoint blocks until it is closed
+	rejectAuth string        // when set, requests carrying exactly this Authorization get 401
 }
 
 func newFakeGoogle(t *testing.T) *fakeGoogle {
@@ -103,6 +104,9 @@ func (g *fakeGoogle) send(w http.ResponseWriter, r *http.Request) {
 	g.sendPaths = append(g.sendPaths, r.URL.Path)
 	g.mu.Unlock()
 	code, resp := g.sendStatus(call)
+	if g.rejectAuth != "" && r.Header.Get("Authorization") == g.rejectAuth {
+		code, resp = 401, `{"error":{"status":"UNAUTHENTICATED"}}`
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_, _ = io.WriteString(w, resp)
@@ -267,12 +271,7 @@ func TestParseCredentials(t *testing.T) {
 func TestConcurrentUnauthorizedSharesOneRefresh(t *testing.T) {
 	g := newFakeGoogle(t)
 	const n = 12
-	g.sendStatus = func(call int) (int, string) {
-		if call <= n { // every first attempt is rejected, as after a server-side revoke
-			return 401, `{"error":{"status":"UNAUTHENTICATED"}}`
-		}
-		return 200, `{}`
-	}
+	g.rejectAuth = "Bearer ya29.token-1" // the first token is dead, as after a server-side revoke
 	s, _ := New(g.creds(), Options{BaseURL: g.fcmSrv.URL})
 	var wg sync.WaitGroup
 	for range n {
