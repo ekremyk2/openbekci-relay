@@ -1,0 +1,26 @@
+# Example: the relay behind your own TLS terminator (Caddy, nginx, a load balancer).
+# Copy relay.example.env to relay.env and edit it, put the credential files in ./secrets/.
+services:
+  relay:
+    image: openbekci-relay:latest        # docker build -t openbekci-relay:latest ..
+    restart: unless-stopped
+    env_file: relay.env
+    ports:
+      - "127.0.0.1:8080:8080"           # publish only to the local TLS proxy
+    volumes:
+      - relay-data:/data                 # SQLite: enrollments, nonces, quota counters
+    secrets:
+      - fcm_service_account
+      - apns_key
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+volumes:
+  relay-data:
+
+secrets:
+  fcm_service_account:
+    file: ./secrets/fcm-service-account.json
+  apns_key:
+    file: ./secrets/AuthKey_ABC123DEFG.p8
